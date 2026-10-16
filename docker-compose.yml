@@ -1,0 +1,106 @@
+name: lakehouse
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: lakehouse-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: lakehouse-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/lakehouse &&
+      echo 'bucket lakehouse ready'
+      "
+
+  postgres:
+    image: postgres:16
+    container_name: lakehouse-pg
+    environment:
+      POSTGRES_USER: lakekeeper
+      POSTGRES_PASSWORD: lakekeeper
+      POSTGRES_DB: lakekeeper
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lakekeeper -d lakekeeper"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:latest-main
+    container_name: lakekeeper-migrate
+    restart: "no"
+    command: ["migrate"]
+    environment: &lk-env
+      LAKEKEEPER__PG_ENCRYPTION_KEY: "change-me-to-a-long-random-string"
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:lakekeeper@postgres:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:lakekeeper@postgres:5432/lakekeeper
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:latest-main
+    container_name: lakekeeper
+    command: ["serve"]
+    environment: *lk-env
+    ports:
+      - "8181:8181"
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/home/nonroot/iceberg-catalog", "healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  trino:
+    image: trinodb/trino:476
+    container_name: trino
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro
+      - ./sql:/sql:ro
+    depends_on:
+      - lakekeeper
+
+  superset:
+    profiles: ["bi"]
+    build: ./superset
+    container_name: superset
+    environment:
+      SUPERSET_SECRET_KEY: "change-me-superset-secret-key-0123456789"
+    ports:
+      - "8088:8088"
+    depends_on:
+      - trino
+
+volumes:
+  minio-data:
+  pg-data:
