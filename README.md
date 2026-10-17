@@ -47,7 +47,31 @@ docker compose --profile bi up -d --build superset   # часть 2
 
 ### Bronze
 
-| Таблица | Колонки | Строк | Вес, МБ | Формат | Сжатие | Время записи, с | Время запроса Q3, с | Размер Bronze, МБ |
+| Таблица | Колонки | Строк | Вес, МБ | Формат | Сжатие | Партиционирование | Обоснование |
+|---|---|---|---|---|---|---|---|
+| bronze.customer | custkey, name, nationkey, acctbal, mktsegment | 150 000 | 1.0 | PARQUET | ZSTD | нет | Маленькая таблица, партиции только плодили бы мелкие файлы. |
+| bronze.orders | orderkey, custkey, orderstatus, totalprice, orderdate, orderpriority, shippriority | 1 500 000 | 13.6 | PARQUET | ZSTD | нет | Данные «как есть», без преобразований; без партиций, чтобы Bronze оставался простым снимком источника. |
+| bronze.lineitem | orderkey, linenumber, extendedprice, discount, shipdate | 6 001 215 | 39.6 | PARQUET | ZSTD | нет | Самая большая таблица; колоночный Parquet читает только 4 нужных колонки, ZSTD даёт хороший коэффициент сжатия. |
+
+Parquet выбран потому, что запрос аналитический (много строк, мало колонок, агрегаты): колоночное хранение и статистика min/max по row group позволяют пропускать данные.
+
+### Silver
+
+| Таблица | Колонки | Строк | Вес, МБ | Формат | Сжатие | Партиционирование | Обоснование |
+|---|---|---|---|---|---|---|---|
+| silver.order_lines | orderkey, linenumber, extendedprice, discount, line_revenue, shipdate, orderdate, shippriority, mktsegment | 30 519 | 0.4 | PARQUET | ZSTD | month(orderdate) | Применены фильтры Q3 (BUILDING, orderdate/shipdate), нормализация сегмента (`upper(trim)`), проверка discount ∈ [0,1], обогащение `line_revenue`. Партиция по месяцу orderdate: диапазон дат ограничен, фильтр `orderdate < 1995-03-15` отсекает партиции целиком. |
+
+### Gold
+
+| Таблица | Колонки | Строк | Вес, МБ | Формат | Сжатие | Партиционирование | Обоснование |
+|---|---|---|---|---|---|---|---|
+| gold.shipping_priority_top10 | orderkey, revenue, orderdate, shippriority | 10 | <0.01 | PARQUET | ZSTD | нет | 10 строк; витрина читается BI-инструментом целиком, партиционировать нечего. |
+
+## 5. Тесты производительности
+
+Прогон: `bash scripts/bench.sh` (создаёт схемы `bench_<формат>_<кодек>`, замеряет время записи, среднее по 3 запускам Q3 и размер данных, пишет `benchmark_results.csv`). Время запроса также видно в `system.runtime.queries`.
+
+| Формат | Сжатие | Время записи, с | Время запроса Q3, с | Размер Bronze, МБ |
 |---|---|---|---|---|
 | PARQUET | NONE | 4.9 | 1.63 | 136.9 |
 | PARQUET | SNAPPY | 4.5 | 1.24 | 78.7 |
@@ -60,7 +84,7 @@ docker compose --profile bi up -d --build superset   # часть 2
 
 Время записи - три CTAS (customer, orders, lineitem), время запроса - среднее из 3 запусков Q3 по Bronze-таблицам соответствующей схемы, размер - сумма файлов трёх таблиц.
 
-**Вывод.** Без сжатия Parquet весит 136.9 МБ и даёт самый медленный запрос (1.63 с): данных читается больше, а CPU на распаковку экономится слабо, поэтому сжатие здесь ускоряет запрос, а не замедляет. Среди Parquet-вариантов лучший - ZSTD: самый маленький размер (54.2 МБ, в 2.5 раза меньше, чем без сжатия), самая быстрая запись (3.9 с) и самый быстрый запрос (1.19 с). GZIP сжимает почти так же (54.6 МБ), но пишет почти вдвое дольше (7.4 с против 3.9 с) и запрос у него медленнее (1.42 с), то есть выигрыша в размере нет, а по CPU он дороже. SNAPPY быстро пишет (4.5 с), но файлы на 45% больше, чем у ZSTD (78.7 против 54.2 МБ). Сжатие критично для размера: ORC без сжатия весит 139.4 МБ, а с ZSTD - 59.3 МБ, то есть в 2.4 раза меньше. ORC в этом тесте запрашивается чуть быстрее Parquet (1.04–1.19 с против 1.19–1.42 с), но разница около 0.1–0.2 с на sf1 при одной машине и трёх запусках находится в пределах шума, а по размеру лучший Parquet (54.2 МБ) компактнее лучшего ORC (58.0 МБ у GZIP). Для Bronze выбран Parquet + ZSTD как лучший баланс размера и скорости.
+**Вывод.** Без сжатия Parquet весит 136.9 МБ и даёт самый медленный запрос (1.63 с): данных читается больше, а CPU на распаковку экономится слабо, поэтому сжатие здесь ускоряет запрос, а не замедляет. Среди Parquet-вариантов лучший - ZSTD: самый маленький размер (54.2 МБ, в 2.5 раза меньше, чем без сжатия), самая быстрая запись (3.9 с) и самый быстрый запрос (1.19 с). GZIP сжимает почти так же (54.6 МБ), но пишет почти вдвое дольше (7.4 с против 3.9 с) и запрос у него медленнее (1.42 с), то есть выигрыша в размере нет, а по CPU он дороже. SNAPPY быстро пишет (4.5 с), но файлы на 45% больше, чем у ZSTD (78.7 против 54.2 МБ). Сжатие критично для размера: ORC без сжатия весит 139.4 МБ, а с ZSTD - 59.3 МБ, то есть в 2.4 раза меньше. ORC в этом тесте запрашивается чуть быстрее Parquet (1.04-1.19 с против 1.19-1.42 с), но разница около 0.1-0.2 с на sf1 при одной машине и трёх запусках находится в пределах шума, а по размеру лучший Parquet (54.2 МБ) компактнее лучшего ORC (58.0 МБ у GZIP). Для Bronze выбран Parquet + ZSTD как лучший баланс размера и скорости.
 
 ## 6. Часть 2
 
@@ -90,7 +114,7 @@ CALL lakehouse.system.rollback_to_snapshot('silver', 'order_lines', <snapshot_id
 Развёртывание: `docker compose --profile bi up -d --build superset` (образ из `superset/Dockerfile` с драйвером `trino`).
 Первичная настройка (один раз): `docker exec -it superset superset fab create-admin --username admin --firstname a --lastname a --email a@a.a --password admin && docker exec superset superset db upgrade && docker exec superset superset init`.
 
-Действия в UI: http://localhost:8088 → Settings → Database Connections → + Database → Trino, SQLAlchemy URI `trino://admin@trino:8080/lakehouse` → SQL Lab → `SELECT mktsegment, count(*) FROM bronze.customer GROUP BY 1` - видны данные Bronze из MinIO. [вставь свой скриншот SQL Lab].
+Действия в UI: http://localhost:8088 → Settings → Database Connections → + Database → Trino, SQLAlchemy URI `trino://admin@trino:8080/lakehouse` → SQL Lab → `SELECT mktsegment, count(*) FROM bronze.customer GROUP BY 1` - видны данные Bronze из MinIO.
 
 ## 7. Выводы
 
